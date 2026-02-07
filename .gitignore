@@ -1,0 +1,17 @@
+# 构建目录
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 编译产物
+*.o
+*.out
+
+# 测试数据生成
+gen_data.py
+insert_data.sql
