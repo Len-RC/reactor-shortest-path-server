@@ -1,0 +1,33 @@
+# 构建目录
+build/
+*.o
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+logs/
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*.backup
+nohup.out
+
+# 测试数据
+gen_data.py
+insert_data.sql
+
+# 文档（不需要的）
+NEXT_STEPS.md
+PROJECT_EVALUATION.md
+
+# 系统文件
+.DS_Store
+Thumbs.db
