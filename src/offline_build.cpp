@@ -1,5 +1,6 @@
 #include <mysql/mysql.h>
 #include <iostream>
+#include <hiredis/hiredis.h>
 #include <vector>
 #include <queue>
 #include <algorithm>
@@ -165,6 +166,58 @@ static void batchInsertPrev(MYSQL* conn, int start_id,
     execSQL(conn, oss.str());
 }
 
+
+// 批量写入Redis（距离）- 带版本前缀
+static void batchWriteRedisDist(redisContext* ctx, int start_id,
+                                const vector<int>& idx_to_id,
+                                const vector<int>& dist,
+                                const string& version_prefix) {
+    for (size_t i = 0; i < idx_to_id.size(); ++i) {
+        int end_id = idx_to_id[i];
+        if (dist[i] == INF) continue;
+        
+        string key = version_prefix + ":dist:" + to_string(start_id) + ":" + to_string(end_id);
+        redisAppendCommand(ctx, "SET %s %d", key.c_str(), dist[i]);
+    }
+    
+    // 读取所有响应
+    redisReply* reply;
+    for (size_t i = 0; i < idx_to_id.size(); ++i) {
+        if (dist[i] != INF) {
+            redisGetReply(ctx, (void**)&reply);
+            freeReplyObject(reply);
+        }
+    }
+}
+
+// 批量写入Redis（前驱节点）- 带版本前缀
+static void batchWriteRedisPrev(redisContext* ctx, int start_id,
+                                const vector<int>& idx_to_id,
+                                const vector<int>& dist,
+                                const vector<int>& pre,
+                                const string& version_prefix) {
+    for (size_t i = 0; i < idx_to_id.size(); ++i) {
+        int end_id = idx_to_id[i];
+        if (dist[i] == INF || pre[i] == -1) continue;
+        
+        string key = version_prefix + ":prev:" + to_string(start_id) + ":" + to_string(end_id);
+        int prev_id = idx_to_id[pre[i]];
+        redisAppendCommand(ctx, "SET %s %d", key.c_str(), prev_id);
+    }
+    
+    // 读取响应
+    redisReply* reply;
+    for (size_t i = 0; i < idx_to_id.size(); ++i) {
+        if (dist[i] != INF && pre[i] != -1) {
+            redisGetReply(ctx, (void**)&reply);
+            freeReplyObject(reply);
+        }
+    }
+}
+
+
+
+
 int main(int argc, char** argv) {
     if (argc < 6) {
         cerr << "示例：" << argv[0] << " 192.168.3.9 3306 root root reactor_db\n";
@@ -193,6 +246,39 @@ int main(int argc, char** argv) {
         cerr << "mysql连接失败\n";
         return 1;
     }
+
+        // 连接Redis
+    cout << "连接Redis...\n";
+    redisContext* redis_ctx = redisConnect("127.0.0.1", 6379);
+    if (redis_ctx == nullptr || redis_ctx->err) {
+        cerr << "Redis连接失败\n";
+        if (redis_ctx) {
+            cerr << "错误: " << redis_ctx->errstr << "\n";
+            redisFree(redis_ctx);
+        }
+        mysql_close(conn);
+        mysql_library_end();
+        return 1;
+    }
+    cout << "Redis连接成功\n";
+
+    // ========== 双版本切换机制开始 ==========
+    cout << "查询当前 Redis 版本...\n";
+    redisReply* ver_reply = (redisReply*)redisCommand(redis_ctx, "GET current_version");
+    int current_version = 0;
+    if (ver_reply && ver_reply->type == REDIS_REPLY_STRING) {
+        current_version = atoi(ver_reply->str);
+        cout << "当前版本: " << current_version << "\n";
+        freeReplyObject(ver_reply);
+    } else {
+        cout << "未找到版本信息，使用默认版本 0\n";
+        if (ver_reply) freeReplyObject(ver_reply);
+    }
+    
+    // 计算新版本号（0 和 1 之间切换）
+    int new_version = 1 - current_version;
+    string new_version_prefix = "v" + to_string(new_version);
+    cout << "将写入新版本: " << new_version << " (前缀: " << new_version_prefix << ")\n";
 
     execSQL(conn, "SET NAMES utf8mb4;");    //防止地点名乱码
 
@@ -285,7 +371,7 @@ int main(int argc, char** argv) {
 
     const int BATCH = 100;
 
-    for (int s = 0; s < n; ++s) {
+        for (int s = 0; s < n; ++s) {
         auto [dist, pre] = graph.dijkstra(s);
         int start_id = idx_to_id[s];
 
@@ -302,8 +388,13 @@ int main(int argc, char** argv) {
         execSQL(conn, "COMMIT;");
         execSQL(conn, "START TRANSACTION;");
 
-        cout << "已完成起点 " << (s+1) << "/" << n << "（start_id=" << start_id << "）\n";
+        // 批量写入Redis - 使用新版本前缀
+        batchWriteRedisDist(redis_ctx, start_id, idx_to_id, dist, new_version_prefix);
+        batchWriteRedisPrev(redis_ctx, start_id, idx_to_id, dist, pre, new_version_prefix);
+
+        cout << "已完成起点 " << (s+1) << "/" << n << "（start_id=" << start_id << "） - 已同步到Redis版本" << new_version << "\n";
     }
+
 
     execSQL(conn, "COMMIT;");
     execSQL(conn, "SET autocommit=1;");
@@ -324,6 +415,50 @@ int main(int argc, char** argv) {
     execSQL(conn, "DROP TABLE shortest_prev_old;");
 
     cout << "mysql更新数据成功\n";
+
+    // ========== 原子切换 Redis 版本 ==========
+    cout << "切换 Redis 版本: " << current_version << " -> " << new_version << "\n";
+    redisReply* set_reply = (redisReply*)redisCommand(redis_ctx, "SET current_version %d", new_version);
+    if (set_reply) {
+        cout << "版本切换成功\n";
+        freeReplyObject(set_reply);
+    }
+    
+    // 清理旧版本数据
+    cout << "清理旧版本数据...\n";
+    string old_version_prefix = "v" + to_string(current_version);
+    
+    // 使用 Lua 脚本批量删除旧版本的键
+    const char* lua_script = 
+        "local keys = redis.call('keys', ARGV[1]) "
+        "for i=1,#keys,5000 do "
+        "  redis.call('del', unpack(keys, i, math.min(i+4999, #keys))) "
+        "end "
+        "return #keys";
+    
+    string pattern = old_version_prefix + ":*";
+    redisReply* del_reply = (redisReply*)redisCommand(redis_ctx, 
+        "EVAL %s 0 %s", lua_script, pattern.c_str());
+    if (del_reply) {
+        if (del_reply->type == REDIS_REPLY_INTEGER) {
+            cout << "已清理 " << del_reply->integer << " 个旧版本键\n";
+        }
+        freeReplyObject(del_reply);
+    }
+
+
+        // 发布缓存更新通知
+    cout << "发布缓存更新通知...\n";
+    redisReply* pub_reply = (redisReply*)redisCommand(redis_ctx, 
+        "PUBLISH cache_update \"reload\"");
+    if (pub_reply) {
+        cout << "通知已发送给 " << pub_reply->integer << " 个订阅者\n";
+        freeReplyObject(pub_reply);
+    }
+
+
+    redisFree(redis_ctx);
+    cout << "Redis连接已关闭\n";
 
     mysql_close(conn);
     mysql_library_end();

@@ -9,6 +9,10 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(Threads REQUIRED)
 
+# 添加Redis支持
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(HIREDIS REQUIRED hiredis)
+
 # ---- MySQL / MariaDB client detection ----
 # Prefer mysql_config (works well with mysql-community-devel and many installs)
 find_program(MYSQL_CONFIG mysql_config)
@@ -45,11 +49,13 @@ endif()
 add_executable(server src/server.cpp)
 if(MYSQL_CONFIG)
   target_compile_options(server PRIVATE ${MYSQL_CFLAGS_LIST})
-  target_link_libraries(server PRIVATE ${MYSQL_LDFLAGS_LIST} Threads::Threads)
+  target_link_libraries(server PRIVATE ${MYSQL_LDFLAGS_LIST} Threads::Threads ${HIREDIS_LIBRARIES})
+  target_include_directories(server PRIVATE ${HIREDIS_INCLUDE_DIRS})
 else()
-  target_include_directories(server PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS})
-  target_link_libraries(server PRIVATE ${MYSQLCLIENT_LIBRARIES} Threads::Threads)
+  target_include_directories(server PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS} ${HIREDIS_INCLUDE_DIRS})
+  target_link_libraries(server PRIVATE ${MYSQLCLIENT_LIBRARIES} Threads::Threads ${HIREDIS_LIBRARIES})
 endif()
+
 
 # ===== benchmark tool =====
 add_executable(benchmark src/benchmark.cpp)
@@ -59,8 +65,10 @@ target_link_libraries(benchmark PRIVATE Threads::Threads)
 add_executable(offline_build src/offline_build.cpp)
 if(MYSQL_CONFIG)
   target_compile_options(offline_build PRIVATE ${MYSQL_CFLAGS_LIST})
-  target_link_libraries(offline_build PRIVATE ${MYSQL_LDFLAGS_LIST} Threads::Threads)
+  target_link_libraries(offline_build PRIVATE ${MYSQL_LDFLAGS_LIST} Threads::Threads ${HIREDIS_LIBRARIES})
+  target_include_directories(offline_build PRIVATE ${HIREDIS_INCLUDE_DIRS})
 else()
-  target_include_directories(offline_build PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS})
-  target_link_libraries(offline_build PRIVATE ${MYSQLCLIENT_LIBRARIES} Threads::Threads)
+  target_include_directories(offline_build PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS} ${HIREDIS_INCLUDE_DIRS})
+  target_link_libraries(offline_build PRIVATE ${MYSQLCLIENT_LIBRARIES} Threads::Threads ${HIREDIS_LIBRARIES})
 endif()
+

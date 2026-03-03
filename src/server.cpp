@@ -22,6 +22,12 @@
 #include <cctype>
 #include <cstdio>
 #include <mysql/mysql.h>
+#include <signal.h>
+#include <atomic>
+#include <hiredis/hiredis.h>
+#include <fstream>
+#include <sstream>
+
 
 //提前声明
 class EventLoop;
@@ -115,6 +121,89 @@ private:
     std::string out_buffer_;//输出缓冲，存储要向客户端发送的数据
 };
 
+
+//Redis连接池
+class RedisPool {
+private:
+    std::string host_;
+    int port_;
+    std::queue<redisContext*> pool_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    int init_size_;
+    int max_size_;
+    std::atomic<int> connection_count_{0};
+    bool stop_;
+
+    redisContext* createConnection() {
+        redisContext* ctx = redisConnect(host_.c_str(), port_);
+        if (ctx == nullptr || ctx->err) {
+            if (ctx) {
+                std::cerr << "Redis连接失败: " << ctx->errstr << "\n";
+                redisFree(ctx);
+            } else {
+                std::cerr << "Redis连接失败: 无法分配内存\n";
+            }
+            return nullptr;
+        }
+        return ctx;
+    }
+
+public:
+    RedisPool(const std::string& host = "127.0.0.1", int port = 6379, int init_size = 4, int max_size = 8)
+        : host_(host), port_(port), init_size_(init_size), max_size_(max_size), stop_(false) {
+        for (int i = 0; i < init_size_; ++i) {
+            redisContext* ctx = createConnection();
+            if (ctx) {
+                pool_.push(ctx);
+                connection_count_++;
+                std::cout << "Redis连接池：创建第" << i+1 << "个初始连接成功\n";
+            }
+        }
+        std::cout << "Redis连接池初始化完毕\n";
+    }
+
+    ~RedisPool() {
+        stop_ = true;
+        cv_.notify_all();
+        std::unique_lock<std::mutex> lock(mtx_);
+        while (!pool_.empty()) {
+            redisContext* ctx = pool_.front();
+            pool_.pop();
+            redisFree(ctx);
+            connection_count_--;
+        }
+        std::cout << "Redis连接池已关闭\n";
+    }
+
+    RedisPool(const RedisPool&) = delete;
+    RedisPool& operator=(const RedisPool&) = delete;
+
+    std::shared_ptr<redisContext> getConnection() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (!cv_.wait_for(lock, std::chrono::seconds(5), [this]() { return !pool_.empty() || stop_; })) {
+            std::cerr << "获取Redis连接超时\n";
+            return nullptr;
+        }
+        if (stop_) return nullptr;
+        redisContext* ctx = pool_.front();
+        pool_.pop();
+        return std::shared_ptr<redisContext>(ctx, [this](redisContext* c) {
+            std::unique_lock<std::mutex> lock(mtx_);
+            pool_.push(c);
+            cv_.notify_one();
+        });
+    }
+
+    static RedisPool& getInstance() {
+        static RedisPool instance;
+        return instance;
+    }
+};
+
+
+
+
 //MySQL连接池
 class ConnectionPool
 {
@@ -133,99 +222,75 @@ private:
 	std::mutex _queueMutex;
 	std::condition_variable cv_in;  //往队列添加新连接的条件变量
 	std::condition_variable cv_out;  //在队列取连接的条件变量
-    std::unordered_map<std::string,int> name_to_id;  //映射表， 通过name转换成相应id
-std::unordered_map<int,std::string> id_to_name;    //同理，id变name
-std::mutex _cacheMtx;
-bool _cacheLoaded = false;    //记录是否已经加载过id表
+    
+        // 双缓存结构（仅缓存地点名称映射，距离和路径数据已迁移到Redis）
+    struct CacheData {
+        std::unordered_map<std::string, int> name_to_id;
+        std::unordered_map<int, std::string> id_to_name;
+    };
 
-// 内存缓存：最短距离和前驱节点（启动时一次性加载，查询时不再访问MySQL）
-// key: (start_id << 32 | end_id)  用64位整数做联合key，避免嵌套map
-std::unordered_map<long long, int> _distCache;     // (start,end) -> dist, 不存在代表不可达
-std::unordered_map<long long, int> _prevCache;     // (start,end) -> prev_id, 不存在代表无前驱
-bool _distCacheLoaded = false;
+    
+    CacheData _cache[2];  // 双缓存：0 和 1
+    std::atomic<int> _currentVersion{0};  // 当前版本号（0 或 1）
+    std::atomic<int> _redis_current_version{0};
+    std::mutex _updateMutex;  // 更新缓存时的互斥锁
+    bool _cacheLoaded = false;
 
 static long long makeKey(int start_id, int end_id) {
     return ((long long)start_id << 32) | (unsigned int)end_id;
 }
 
+void loadCacheData(MYSQL* conn, CacheData& cache) {
+    // 只加载 place 表（地点名称映射）
+    if (mysql_query(conn, "SELECT id, name FROM place;") != 0) {
+        std::cerr << "加载place表失败\n";
+        return;
+    }
+    MYSQL_RES* res = mysql_store_result(conn);
+    if (res) {
+        MYSQL_ROW row;
+        while ((row = mysql_fetch_row(res))) {
+            int id = std::atoi(row[0]);
+            std::string name = row[1] ? row[1] : "";
+            cache.name_to_id[name] = id;
+            cache.id_to_name[id] = name;
+        }
+        mysql_free_result(res);
+    }
+
+    std::cout << "缓存加载完成: place=" << cache.name_to_id.size() << "\n";
+}
+
+
 void loadPlaceCache(MYSQL* conn) {
-    std::lock_guard<std::mutex> lock(_cacheMtx);
+    std::lock_guard<std::mutex> lock(_updateMutex);
     if (_cacheLoaded) 
         return;
 
-    if (mysql_query(conn, "SELECT id, name FROM place;") != 0) {
-        std::cerr << "加载id表失败\n";
-        return;
-    }
-    MYSQL_RES* res = mysql_store_result(conn);
-    if (!res) 
-       return;
-
-    MYSQL_ROW row;
-
-    //获取id表中数据并存储
-    while ((row = mysql_fetch_row(res))) {
-        int id = std::atoi(row[0]);
-        std::string name = row[1] ? row[1] : "";
-        name_to_id[name] = id;
-        id_to_name[id] = name;
-    }
-
-    mysql_free_result(res);
+    std::cout << "首次加载缓存到版本 0...\n";
+    // 初次加载：加载到版本 0
+    loadCacheData(conn, _cache[0]);
     _cacheLoaded = true;
+    
+    // 初始化 Redis 版本号缓存
+    auto redis_conn = RedisPool::getInstance().getConnection();
+    if (redis_conn) {
+        redisReply* ver_reply = (redisReply*)redisCommand(redis_conn.get(), "GET current_version");
+        if (ver_reply && ver_reply->type == REDIS_REPLY_STRING) {
+            int redis_version = std::atoi(ver_reply->str);
+            _redis_current_version.store(redis_version, std::memory_order_release);
+            std::cout << "初始化 Redis 版本号: " << redis_version << "\n";
+            freeReplyObject(ver_reply);
+        } else {
+            std::cout << "Redis 版本号未找到，使用默认值 0\n";
+            if (ver_reply) freeReplyObject(ver_reply);
+        }
+    }
 }
 
-// 加载最短距离和前驱表到内存
-void loadDistCache(MYSQL* conn) {
-    std::lock_guard<std::mutex> lock(_cacheMtx);
-    if (_distCacheLoaded)
-        return;
-
-    // 加载 shortest_dist
-    if (mysql_query(conn, "SELECT start_id, end_id, dist FROM shortest_dist;") != 0) {
-        std::cerr << "加载shortest_dist缓存失败\n";
-        return;
-    }
-    MYSQL_RES* res = mysql_store_result(conn);
-    if (res) {
-        MYSQL_ROW row;
-        while ((row = mysql_fetch_row(res))) {
-            if (!row[0] || !row[1]) continue;
-            int s = std::atoi(row[0]);
-            int e = std::atoi(row[1]);
-            if (row[2])
-                _distCache[makeKey(s, e)] = std::atoi(row[2]);
-        }
-        mysql_free_result(res);
-    }
-
-    // 加载 shortest_prev
-    if (mysql_query(conn, "SELECT start_id, end_id, prev_id FROM shortest_prev;") != 0) {
-        std::cerr << "加载shortest_prev缓存失败\n";
-        _distCacheLoaded = true;
-        return;
-    }
-    res = mysql_store_result(conn);
-    if (res) {
-        MYSQL_ROW row;
-        while ((row = mysql_fetch_row(res))) {
-            if (!row[0] || !row[1]) continue;
-            int s = std::atoi(row[0]);
-            int e = std::atoi(row[1]);
-            if (row[2])
-                _prevCache[makeKey(s, e)] = std::atoi(row[2]);
-        }
-        mysql_free_result(res);
-    }
-
-    std::cout << "内存缓存加载完成: dist=" << _distCache.size()
-              << " prev=" << _prevCache.size() << "\n";
-    _distCacheLoaded = true;
-}
-
-	ConnectionPool() :_ip(getenv("MYSQL_HOST") ? getenv("MYSQL_HOST") : "127.0.0.1"),
+	ConnectionPool() :_ip(getenv("MYSQL_HOST") ? getenv("MYSQL_HOST") : "10.4.126.93"),
 		_username(getenv("MYSQL_USER") ? getenv("MYSQL_USER") : "root"),
-		_password(getenv("MYSQL_PASS") ? getenv("MYSQL_PASS") : ""),
+		_password(getenv("MYSQL_PASS") ? getenv("MYSQL_PASS") : "root"),
 		_dbname(getenv("MYSQL_DB") ? getenv("MYSQL_DB") : "reactor_db"),
 		_port(getenv("MYSQL_PORT") ? std::atoi(getenv("MYSQL_PORT")) : 3306),
 		_initSize(4),
@@ -377,6 +442,52 @@ public:
 		return sp;
 	}
 
+// 更新缓存（双缓冲方案，零停机更新）
+void updateCache() {
+    std::lock_guard<std::mutex> lock(_updateMutex);
+    
+    std::cout << "开始更新缓存...\n";
+    
+    // 获取 MySQL 连接
+    std::shared_ptr<MYSQL> conn_ptr = getConnection();
+    if (!conn_ptr) {
+        std::cerr << "更新缓存失败：无法获取数据库连接\n";
+        return;
+    }
+    
+   //  获取 Redis 连接并更新版本号缓存
+    auto redis_conn = RedisPool::getInstance().getConnection();
+    if (redis_conn) {
+        redisReply* ver_reply = (redisReply*)redisCommand(redis_conn.get(), "GET current_version");
+        if (ver_reply && ver_reply->type == REDIS_REPLY_STRING) {
+            int new_redis_version = std::atoi(ver_reply->str);
+            _redis_current_version.store(new_redis_version, std::memory_order_release);
+            std::cout << "Redis 版本号已更新为: " << new_redis_version << "\n";
+            freeReplyObject(ver_reply);
+        } else {
+            if (ver_reply) freeReplyObject(ver_reply);
+        }
+    }
+
+
+    // 确定备用版本
+    int current = _currentVersion.load(std::memory_order_acquire);
+    int backup = 1 - current;  // 0->1 或 1->0
+    
+    // 清空备用缓存
+    _cache[backup].name_to_id.clear();
+    _cache[backup].id_to_name.clear();
+
+    
+    // 从 MySQL 加载数据到备用缓存
+    loadCacheData(conn_ptr.get(), _cache[backup]);
+    
+    // 5. 原子切换版本号
+    _currentVersion.store(backup, std::memory_order_release);
+    
+    std::cout << "缓存更新完成，版本切换: " << current << " -> " << backup << "\n";
+}
+
 // 处理客户端请求（双地点名查询最短距离）
 std::string handleClientRequest(const std::string& client_input) {
     std::shared_ptr<MYSQL> conn_ptr = getConnection();
@@ -390,9 +501,21 @@ std::string handleClientRequest(const std::string& client_input) {
         return final_result + "\n";
     }
 
-    // 确保缓存加载
+    // 确保place表缓存加载（name到id的映射仍然从MySQL加载）
     loadPlaceCache(conn);
-    loadDistCache(conn);
+
+    // 读取当前版本号
+    int version = _currentVersion.load(std::memory_order_acquire);
+    const CacheData& cache = _cache[version];
+
+    // 获取Redis连接
+    auto redis_conn = RedisPool::getInstance().getConnection();
+    if (!redis_conn) {
+        std::cerr << "获取Redis连接失败，降级到MySQL\n";
+        // 这里可以降级到MySQL，暂时返回错误
+        return "服务暂时不可用\n";
+    }
+
 
     try {
         size_t space_pos = client_input.find(' ');  ///查找客户端发来数据的第一个空格的位置下标
@@ -408,12 +531,11 @@ std::string handleClientRequest(const std::string& client_input) {
             [](char c){ return c=='\n' || c=='\r'; }), end_place.end());
 
         int start_id = -1, end_id = -1;
-        //通过name找相应的id
+        //通过name找相应的id（无锁读取）
         {
-            std::lock_guard<std::mutex> lk(_cacheMtx);
-            auto it1 = name_to_id.find(start_place);
-            auto it2 = name_to_id.find(end_place);
-            if (it1 == name_to_id.end() || it2 == name_to_id.end()) {
+            auto it1 = cache.name_to_id.find(start_place);
+            auto it2 = cache.name_to_id.find(end_place);
+            if (it1 == cache.name_to_id.end() || it2 == cache.name_to_id.end()) {
                 final_result = "地点不存在，重新输入";
                 return final_result + "\n";
             }
@@ -421,45 +543,64 @@ std::string handleClientRequest(const std::string& client_input) {
             end_id = it2->second;
         }
 
-        // 从内存缓存查最短距离
+        // 从Redis查询最短距离（使用缓存的版本前缀）
         {
-            auto dist_it = _distCache.find(makeKey(start_id, end_id));
-            if (dist_it == _distCache.end()) {
+            // 使用缓存的 Redis 版本号（不需要每次查询 Redis）
+            int redis_version = _redis_current_version.load(std::memory_order_acquire);
+            std::string version_prefix = "v" + std::to_string(redis_version);
+            
+            // 构造带版本前缀的键
+            std::string dist_key = version_prefix + ":dist:" + std::to_string(start_id) + ":" + std::to_string(end_id);
+            redisReply* dist_reply = (redisReply*)redisCommand(redis_conn.get(), "GET %s", dist_key.c_str());
+            
+            if (!dist_reply || dist_reply->type != REDIS_REPLY_STRING) {
+                if (dist_reply) freeReplyObject(dist_reply);
                 final_result = "无最短距离";
                 return final_result + "\n";
             }
+            
+            int dist = std::atoi(dist_reply->str);
+            std::string dist_str = std::to_string(dist);
+            freeReplyObject(dist_reply);
 
-            std::string dist_str = std::to_string(dist_it->second);
 
-            // 从内存缓存回溯路径
-            std::vector<int> path_ids;  //存储路径回溯的id
+            // 从Redis回溯路径（使用相同的版本前缀）
+            std::vector<int> path_ids;
             int cur = end_id;
             path_ids.push_back(cur);
 
-            while(cur!=start_id)
+            while(cur != start_id)
             {
-                auto it = _prevCache.find(makeKey(start_id, cur));
-                if(it != _prevCache.end())
-                {
-                    path_ids.push_back(it->second);
-                    cur = it->second;
-                }else{
+                std::string prev_key = version_prefix + ":prev:" + std::to_string(start_id) + ":" + std::to_string(cur);
+                redisReply* prev_reply = (redisReply*)redisCommand(redis_conn.get(), "GET %s", prev_key.c_str());
+                
+                if (!prev_reply || prev_reply->type != REDIS_REPLY_STRING) {
+                    if (prev_reply) freeReplyObject(prev_reply);
                     final_result = "路径回溯失败";
                     return final_result + "\n";
                 }
+                
+                int prev_id = std::atoi(prev_reply->str);
+                freeReplyObject(prev_reply);
+                
+                path_ids.push_back(prev_id);
+                cur = prev_id;
             }
 
             std::reverse(path_ids.begin(), path_ids.end());  //反转路径，将倒序的路径归正
 
             std::string path_str;
+            // 无锁读取 id_to_name（使用 find 避免异常）
+            for(size_t i=0; i<path_ids.size(); ++i)
             {
-                std::lock_guard<std::mutex> lk(_cacheMtx);
-                path_str+=id_to_name[path_ids[0]];
-                for(size_t i=1;i<path_ids.size();++i)
-                {
-                    path_str+="->";
-                    path_str+=id_to_name[path_ids[i]];
-                }       
+                if (i > 0) path_str += "->";
+                
+                auto name_it = cache.id_to_name.find(path_ids[i]);
+                if (name_it != cache.id_to_name.end()) {
+                    path_str += name_it->second;
+                } else {
+                    path_str += "未知(" + std::to_string(path_ids[i]) + ")";
+                }
             }
 
             final_result = "最短距离=" + dist_str + "，路径=" + path_str;
@@ -472,6 +613,75 @@ std::string handleClientRequest(const std::string& client_input) {
     }
 }
 };
+
+
+// Redis订阅监听器（用于接收缓存更新通知）
+class CacheUpdateListener {
+private:
+    redisContext* sub_ctx_;
+    std::thread listener_thread_;
+    std::atomic<bool> stop_{false};
+
+public:
+    CacheUpdateListener() : sub_ctx_(nullptr) {}
+
+    ~CacheUpdateListener() {
+        stop();
+    }
+
+    void start() {
+        // 创建独立的Redis连接用于订阅
+        sub_ctx_ = redisConnect("127.0.0.1", 6379);
+        if (sub_ctx_ == nullptr || sub_ctx_->err) {
+            std::cerr << "订阅器Redis连接失败\n";
+            return;
+        }
+
+        std::cout << "启动缓存更新监听器...\n";
+
+        // 启动监听线程
+        listener_thread_ = std::thread([this]() {
+            // 订阅频道
+            redisReply* reply = (redisReply*)redisCommand(sub_ctx_, "SUBSCRIBE cache_update");
+            if (reply) {
+                std::cout << "已订阅 cache_update 频道\n";
+                freeReplyObject(reply);
+            }
+
+            // 循环接收消息
+            while (!stop_) {
+                redisReply* msg;
+                if (redisGetReply(sub_ctx_, (void**)&msg) == REDIS_OK) {
+                    if (msg->type == REDIS_REPLY_ARRAY && msg->elements == 3) {
+                        // msg->element[0] = "message"
+                        // msg->element[1] = "cache_update"
+                        // msg->element[2] = 消息内容
+                        std::cout << "\n收到缓存更新通知: " << msg->element[2]->str << "\n";
+                        std::cout << "开始刷新缓存...\n";
+                        
+                        // 触发缓存更新
+                        ConnectionPool::getInstance().updateCache();
+                        
+                        std::cout << "缓存刷新完成\n";
+                    }
+                    freeReplyObject(msg);
+                }
+            }
+        });
+    }
+
+    void stop() {
+        stop_ = true;
+        if (sub_ctx_) {
+            redisFree(sub_ctx_);
+            sub_ctx_ = nullptr;
+        }
+        if (listener_thread_.joinable()) {
+            listener_thread_.detach();  // 让线程自然结束
+        }
+    }
+};
+
 
 
 
@@ -489,8 +699,9 @@ public:
             exit(EXIT_FAILURE);
         }
         
-        // 设置管道读端为非阻塞，并给epoll监管
+        // 设置管道读端和写端都为非阻塞
         fcntl(pipe_fds_[0], F_SETFL, fcntl(pipe_fds_[0], F_GETFL) | O_NONBLOCK);
+        fcntl(pipe_fds_[1], F_SETFL, fcntl(pipe_fds_[1], F_GETFL) | O_NONBLOCK);
         struct epoll_event ev = {0};
         ev.events = EPOLLIN | EPOLLET;  // 边缘触发模式，提升效率
         ev.data.fd = pipe_fds_[0];
@@ -592,14 +803,15 @@ public:
         msg_q_.push(PendingMsg{fd, res});   //将结果放到队列中，等管道reactor唤醒后统一处理
     }
 
-    // 只写1字节用于唤醒 reactor
+    // 只写1字节用于唤醒 reactor（非阻塞模式）
     uint8_t one = 1;
     ssize_t n = write(pipe_fds_[1], &one, 1);
 
-    // 管道满了，无法继续写入
+    // 管道满了（EAGAIN/EWOULDBLOCK）是正常的，reactor会处理队列中的消息
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        std::cerr << "唤醒管道写入失败\n ";
+        std::cerr << "唤醒管道写入失败: " << strerror(errno) << "\n";
     }
+    // 注意：即使管道满了写入失败，消息已经在队列中，reactor下次处理时会取出
 }
 
 private:
@@ -792,13 +1004,118 @@ private:
 class ConnectionHandler : public Handler {
 public:
     ConnectionHandler(int connfd, std::shared_ptr<ThreadPool> pool,EventLoop* loop)
-        : Handler(loop, connfd), pool_(pool), in_buffer_() {
+        : Handler(loop, connfd), pool_(pool), in_buffer_(), is_http_(false), http_parsed_(false) {
         setEvents(EPOLLIN); // 初始注册读事件，接收客户端数据
         loop->updateHandler(this);
     }
 
+    // URL解码函数
+    std::string urlDecode(const std::string& str) {
+        std::string result;
+        for (size_t i = 0; i < str.length(); ++i) {
+            if (str[i] == '%' && i + 2 < str.length()) {
+                // 将%XX转换为字符
+                int value;
+                std::istringstream is(str.substr(i + 1, 2));
+                if (is >> std::hex >> value) {
+                    result += static_cast<char>(value);
+                    i += 2;
+                } else {
+                    result += str[i];
+                }
+            } else if (str[i] == '+') {
+                result += ' ';
+            } else {
+                result += str[i];
+            }
+        }
+        return result;
+    }
+
+    // 解析HTTP请求
+    bool parseHttpRequest(std::string& start_place, std::string& end_place) {
+        // 查找请求行结束位置
+        size_t header_end = in_buffer_.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            return false; // 还没收到完整HTTP头
+        }
+
+        std::string header = in_buffer_.substr(0, header_end);
+        
+        // 检查是否是GET请求
+        if (header.substr(0, 3) == "GET") {
+            is_http_ = true;
+            
+            // 提取请求路径
+            size_t path_start = header.find(' ') + 1;
+            size_t path_end = header.find(' ', path_start);
+            std::string path = header.substr(path_start, path_end - path_start);
+            
+            // 处理根路径 - 返回HTML页面
+            if (path == "/" || path.find("/?") == 0 || path.find("/api/query") == 0) {
+                if (path == "/") {
+                    return true; // 返回主页
+                }
+                
+                // 解析查询参数 /?start=林1&end=林2 或 /api/query?start=林1&end=林2
+                size_t query_start = path.find('?');
+                if (query_start != std::string::npos) {
+                    std::string query = path.substr(query_start + 1);
+                    
+                    // 解析start参数
+                    size_t start_pos = query.find("start=");
+                    if (start_pos != std::string::npos) {
+                        start_pos += 6; // "start="的长度
+                        size_t start_end = query.find('&', start_pos);
+                        start_place = query.substr(start_pos, start_end - start_pos);
+                        start_place = urlDecode(start_place);
+                    }
+                    
+                    // 解析end参数
+                    size_t end_pos = query.find("end=");
+                    if (end_pos != std::string::npos) {
+                        end_pos += 4; // "end="的长度
+                        size_t end_end = query.find('&', end_pos);
+                        end_place = query.substr(end_pos, end_end - end_pos);
+                        end_place = urlDecode(end_place);
+                    }
+                }
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    // 读取HTML文件
+    std::string readHtmlFile(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            return "<html><body><h1>404 Not Found</h1></body></html>";
+        }
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return buffer.str();
+    }
+
+    // 生成HTML主页
+    std::string generateHtmlPage() {
+        std::string html = readHtmlFile("static/index.html");
+        
+        std::ostringstream response;
+        response << "HTTP/1.1 200 OK\r\n"
+                 << "Content-Type: text/html; charset=utf-8\r\n"
+                 << "Content-Length: " << html.length() << "\r\n"
+                 << "Connection: keep-alive\r\n"
+                 << "Keep-Alive: timeout=60, max=100\r\n"
+                 << "\r\n"
+                 << html;
+        
+        return response.str();
+    }
+
 void handleRead() override {
-    char buf[1024];
+    char buf[4096];
 
     while (true) {
         ssize_t n = recv(getFd(), buf, sizeof(buf), 0);
@@ -806,40 +1123,98 @@ void handleRead() override {
         if (n > 0) {
             in_buffer_.append(buf, n);
 
-            // 处理粘包：可能一次收到了多行，用while一直读
-            while (true) {
-                size_t pos = in_buffer_.find('\n');
-
-                // 半包，还没收到完整一行
-                if (pos == std::string::npos) 
-                     break; 
-
-                std::string line = in_buffer_.substr(0, pos + 1);
-                in_buffer_.erase(0, pos + 1);
-
-                // 去掉 \r\n
-                while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) 
-                    line.pop_back();
-
-                if (line.empty()) 
-                   continue;
-
-                int fd = getFd();
-                EventLoop* loop_ = getLoop();
-                auto pool = pool_; 
-
-                pool_->submit([loop_, line, fd]() {
-                    try {
-                        ConnectionPool& mysql_pool = ConnectionPool::getInstance();
-                        std::string result = mysql_pool.handleClientRequest(line); 
-                        // 你那边解析时会去掉 '\n'，这里加不加都行，保持一致即可
-
-                        loop_->sendToReactor(fd, result);
-                    } catch (const std::exception& e) {
-                        std::cerr << "客户端fd:" << fd << " 查询异常: " << e.what() << "\n";
-                        loop_->sendToReactor(fd, "无\n");
+            // 如果还没判断协议类型，先尝试解析
+            if (!http_parsed_) {
+                // 检查是否是HTTP请求（需要至少4个字节）
+                if (in_buffer_.size() >= 4 && 
+                    (in_buffer_.substr(0, 4) == "GET " || 
+                     (in_buffer_.size() >= 5 && in_buffer_.substr(0, 5) == "POST "))) {
+                    
+                    std::string start_place, end_place;
+                    if (parseHttpRequest(start_place, end_place)) {
+                        http_parsed_ = true;
+                        in_buffer_.clear();
+                        
+                        int fd = getFd();
+                        EventLoop* loop_ = getLoop();
+                        
+                        // 如果没有查询参数，返回HTML页面
+                        if (start_place.empty() || end_place.empty()) {
+                            std::string html_response = generateHtmlPage();
+                            loop_->sendToReactor(fd, html_response);
+                        } else {
+                            // 有查询参数，处理查询请求
+                            auto pool = pool_;
+                            pool_->submit([loop_, start_place, end_place, fd]() {
+                                try {
+                                    ConnectionPool& mysql_pool = ConnectionPool::getInstance();
+                                    std::string query = start_place + " " + end_place;
+                                    std::string result = mysql_pool.handleClientRequest(query);
+                                    
+                                    // 构造HTTP响应
+                                    std::ostringstream response;
+                                    response << "HTTP/1.1 200 OK\r\n"
+                                             << "Content-Type: text/plain; charset=utf-8\r\n"
+                                             << "Content-Length: " << result.length() << "\r\n"
+                                             << "Connection: keep-alive\r\n"
+                                             << "Keep-Alive: timeout=60, max=100\r\n"
+                                             << "\r\n"
+                                             << result;
+                                    
+                                    loop_->sendToReactor(fd, response.str());
+                                } catch (const std::exception& e) {
+                                    std::cerr << "HTTP查询异常: " << e.what() << "\n";
+                                    std::string error_response = "HTTP/1.1 500 Internal Server Error\r\n\r\n查询失败\n";
+                                    loop_->sendToReactor(fd, error_response);
+                                }
+                            });
+                        }
+                        return; // HTTP请求处理完毕
                     }
-                });
+                } else if (in_buffer_.size() >= 1 && in_buffer_[0] != 'G' && in_buffer_[0] != 'P') {
+                    // 第一个字符不是 'G' 或 'P'，肯定不是 HTTP 请求
+                    http_parsed_ = true;
+                    is_http_ = false;
+                } else if (in_buffer_.find('\n') != std::string::npos) {
+                    // 已经收到换行符，但不是HTTP请求，按TCP协议处理
+                    http_parsed_ = true;
+                    is_http_ = false;
+                }
+                // 否则继续等待更多数据来判断协议类型
+            }
+
+            // TCP协议处理（原有逻辑）
+            if (!is_http_ && http_parsed_) {
+                while (true) {
+                    size_t pos = in_buffer_.find('\n');
+
+                    if (pos == std::string::npos) 
+                         break; 
+
+                    std::string line = in_buffer_.substr(0, pos + 1);
+                    in_buffer_.erase(0, pos + 1);
+
+                    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) 
+                        line.pop_back();
+
+                    if (line.empty()) 
+                       continue;
+
+                    int fd = getFd();
+                    EventLoop* loop_ = getLoop();
+                    auto pool = pool_; 
+
+                    pool_->submit([loop_, line, fd]() {
+                        try {
+                            ConnectionPool& mysql_pool = ConnectionPool::getInstance();
+                            std::string result = mysql_pool.handleClientRequest(line);
+                            loop_->sendToReactor(fd, result);
+                        } catch (const std::exception& e) {
+                            std::cerr << "客户端fd:" << fd << " 查询异常: " << e.what() << "\n";
+                            loop_->sendToReactor(fd, "无\n");
+                        }
+                    });
+                }
             }
             continue;
         }
@@ -851,11 +1226,11 @@ void handleRead() override {
         }
 
         // n < 0
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {   // 已经读空了（非阻塞）
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             break;
         }
 
-        if (errno == EINTR) {    // 被信号打断
+        if (errno == EINTR) {
             continue; 
         }
 
@@ -870,7 +1245,12 @@ void handleRead() override {
     void handleWrite() override {
         std::string& out_buffer = getOutBuffer();
         if (out_buffer.empty()) {
-            // 无数据可发，将读写事件重新注册回读事件
+            // 无数据可发，对于HTTP请求直接关闭连接
+            if (is_http_) {
+                handleClose();
+                return;
+            }
+            // TCP连接重新注册为读事件
             setEvents(EPOLLIN);
             getLoop()->updateHandler(this);
             return;
@@ -879,7 +1259,7 @@ void handleRead() override {
         ssize_t n = send(getFd(), out_buffer.c_str(), out_buffer.size(), 0);
 
         if (n > 0) {
-            std::cout << "向客户端fd:" << getFd() << " 发送结果：" << out_buffer.substr(0, n) <<"\n";
+            std::cout << "向客户端fd:" << getFd() << " 发送结果（" << (is_http_ ? "HTTP" : "TCP") << "）\n";
             out_buffer.erase(0, n); // 移除已发送的数据
         } 
         
@@ -891,10 +1271,16 @@ void handleRead() override {
             }
         }
 
-        // 数据发送完毕，重新注册为读事件
+        // 数据发送完毕
         if (out_buffer.empty()) {
-            setEvents(EPOLLIN);
-            getLoop()->updateHandler(this);
+            if (is_http_) {
+                // HTTP请求处理完毕，关闭连接
+                handleClose();
+            } else {
+                // TCP连接重新注册为读事件
+                setEvents(EPOLLIN);
+                getLoop()->updateHandler(this);
+            }
         }
     }
 
@@ -908,6 +1294,8 @@ void handleRead() override {
 private:
     std::shared_ptr<ThreadPool> pool_; // 线程池指针，用于提交查询任务
     std::string in_buffer_;            // 客户端输入缓冲区
+    bool is_http_;                     // 是否是HTTP协议
+    bool http_parsed_;                 // 是否已解析协议类型
 };
 
 
@@ -917,10 +1305,37 @@ void exit_handler() {
 }
 
 
-int main() {
-    atexit(exit_handler); //注册程序退出处理器，保证异常/正常退出时释放资源
 
-     //初始化你的MySQL连接池
+int main(int argc, char* argv[]) {
+    // 支持命令行参数指定端口，默认9090
+    int port = 9090;
+    if (argc > 1) {
+        port = std::atoi(argv[1]);
+        if (port <= 0 || port > 65535) {
+            std::cerr << "无效的端口号: " << argv[1] << "\n";
+            std::cerr << "用法: " << argv[0] << " [端口号]\n";
+            std::cerr << "示例: " << argv[0] << " 9090\n";
+            return EXIT_FAILURE;
+        }
+    }
+
+    atexit(exit_handler); //注册程序退出处理器，保证异常/正常退出时释放资源
+      try {
+        RedisPool& redis_pool = RedisPool::getInstance();
+        auto conn = redis_pool.getConnection();
+        if (conn) {
+            redisReply* reply = (redisReply*)redisCommand(conn.get(), "PING");
+            if (reply) {
+                std::cout << "Redis连接测试成功: " << reply->str << "\n";
+                freeReplyObject(reply);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Redis连接池初始化失败: " << e.what() << "\n";
+        return EXIT_FAILURE;
+    }
+
+     //初始化MySQL连接池
     try {
         ConnectionPool::getInstance();
         std::cout << "MySQL连接池初始化完成\n";
@@ -929,13 +1344,18 @@ int main() {
         return EXIT_FAILURE;
     }
 
+    // 启动缓存更新监听器
+    CacheUpdateListener cache_listener;
+    cache_listener.start();
+
+
     //初始化Reactor组件：主Reactor+4个从Reactor+线程池
     EventLoop main_loop;
     Reactors reactors(4);
     auto thread_pool = std::make_shared<ThreadPool>(4);
 
     //初始化Acceptor处理器
-    Acceptor acceptor(&main_loop, 9090, &reactors);
+    Acceptor acceptor(&main_loop, port, &reactors);
 
     //设置新连接回调：创建客户端连接处理器
     acceptor.setNewConnectionCallback([thread_pool](int connfd,EventLoop* loop) {
@@ -943,6 +1363,8 @@ int main() {
     });
 
     std::cout << "Reactor高并发查询服务器启动成功\n";
+    std::cout << "监听端口: " << port << "\n";
+    std::cout << "服务器 PID: " << getpid() << "\n";
     // 启动主Reactor事件循环
     main_loop.loop();
 
