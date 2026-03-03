@@ -1,5 +1,0 @@
-/home/amy/project/build/CMakeFiles/server.dir
-/home/amy/project/build/CMakeFiles/benchmark.dir
-/home/amy/project/build/CMakeFiles/offline_build.dir
-/home/amy/project/build/CMakeFiles/edit_cache.dir
-/home/amy/project/build/CMakeFiles/rebuild_cache.dir

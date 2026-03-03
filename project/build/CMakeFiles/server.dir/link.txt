@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/server.dir/src/server.cpp.o -o server  -L/usr/lib64/mysql -lmysqlclient -lpthread -ldl -lssl -lcrypto -lresolv -lm -lrt -lhiredis -lpthread 
