@@ -244,42 +244,7 @@ void sendToReactor(int fd, const std::string& res) {
 **原因**: 测试工具使用阻塞 I/O，串行发送请求  
 **解决**: 使用专业压测工具 (ab, wrk)
 
-## 📖 项目文档
 
-- [性能测试报告](docs/performance.md)
-- [架构设计文档](docs/architecture.md)
-- [API 文档](docs/api.md)
-- [部署指南](docs/deployment.md)
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 📄 许可证
-
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
-
-## 👨‍💻 作者
-
-- GitHub: [@your-username](https://github.com/your-username)
-- Email: your-email@example.com
-
-## 🙏 致谢
-
-感谢以下开源项目：
-- [hiredis](https://github.com/redis/hiredis) - Redis C 客户端
-- [MySQL Connector/C](https://dev.mysql.com/downloads/connector/c/) - MySQL C API
-- [Nginx](https://nginx.org/) - 高性能 Web 服务器
-
-## 📝 更新日志
-
-### v1.0.0 (2024-03-03)
-- ✨ 实现 Reactor 网络模型
-- ✨ 支持 HTTP/TCP 双协议
-- ✨ 实现 Nginx 负载均衡
-- ✨ 实现双缓冲机制
-- 🐛 修复高并发崩溃问题
-- ⚡ 性能优化，QPS 达到 12w+
 
 ---
 
