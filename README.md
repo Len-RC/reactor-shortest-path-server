@@ -1,16 +1,116 @@
 # Reactor 最短路径查询服务
 
-这是一个基于 C++17 的高并发最短路径查询服务。项目使用 Reactor 网络模型处理连接，使用线程池执行查询任务，使用 MySQL 存储地点和边数据，使用 Redis 缓存预计算后的最短距离和路径前驱，并通过 Nginx 将请求负载均衡到多个后端实例。
+一个基于 C++17 实现的高并发最短路径查询服务。项目采用主从 Reactor 网络模型处理连接，使用线程池执行查询任务，使用 MySQL 存储地点和道路边数据，使用 Redis 缓存离线预计算后的最短距离和路径前驱，并通过 Nginx 对多个后端实例做反向代理和负载均衡。
 
-## 功能特点
+## 功能介绍
 
-- 支持 HTTP 查询接口和简单 TCP 查询。
-- 支持 Nginx 反向代理和多实例负载均衡。
-- 使用主 Reactor 接收连接，从 Reactor 处理连接读写。
-- 使用线程池处理查询任务，避免阻塞网络事件循环。
-- 使用 MySQL 连接池管理数据库连接。
-- 使用 Redis 连接池读取最短路径缓存。
-- 支持离线构建最短路径数据，并通过 Redis 发布订阅通知服务刷新缓存。
+- 最短路径查询：输入起点和终点，返回最短距离以及完整路径。
+- HTTP 查询接口：支持浏览器、Nginx、Apache Bench 等 HTTP 客户端访问。
+- TCP 查询接口：支持自定义 TCP 客户端按行发送 `起点 终点` 查询。
+- 静态页面访问：访问 `/` 返回前端查询页面。
+- 多实例部署：同一台机器可启动多个后端端口，由 Nginx 统一转发。
+- 离线构建缓存：从 MySQL 读取图数据，预计算全源最短路径并写入 Redis。
+- 热更新缓存：离线构建完成后通过 Redis 发布订阅通知在线服务刷新版本。
+- 连接池复用：MySQL 和 Redis 均使用连接池，降低频繁建连开销。
+- 高并发处理：网络 I/O、业务查询、缓存访问分层处理，避免阻塞事件循环。
+
+## 技术栈
+
+| 模块 | 技术 |
+| --- | --- |
+| 开发语言 | C++17 |
+| 网络模型 | epoll + 主从 Reactor |
+| 并发模型 | 线程池 + 任务队列 |
+| 数据库 | MySQL / MariaDB |
+| 缓存 | Redis + hiredis |
+| 负载均衡 | Nginx upstream |
+| 构建工具 | CMake |
+| 压测工具 | Apache Bench、自带 TCP benchmark |
+
+## 实现方式
+
+### 网络层
+
+服务端使用主从 Reactor 模型：
+
+1. 主 Reactor 监听服务端口，只负责接收新连接。
+2. `Acceptor` 将新连接分发给从 Reactor。
+3. 从 Reactor 基于 epoll 监听连接读写事件。
+4. `ConnectionHandler` 负责读取请求、解析 HTTP/TCP 协议并组织响应。
+5. 业务查询任务提交到线程池执行，避免慢查询阻塞 epoll 事件循环。
+6. 查询结果通过 `EventLoop::sendToReactor()` 回到所属 Reactor 写回客户端。
+
+### 查询层
+
+一次最短路径查询流程：
+
+1. 客户端请求 `/api/query?start=林1&end=林2`，或通过 TCP 发送 `林1 林2`。
+2. `ConnectionHandler` 解析起点和终点。
+3. 线程池调用 `ConnectionPool::handleClientRequest()`。
+4. MySQL 连接池提供数据库连接，并加载地点名和地点 id 的映射。
+5. Redis 根据当前版本读取 `dist` 和 `prev` 缓存。
+6. 服务端从终点沿前驱节点回溯路径。
+7. 返回 `最短距离=xx，路径=A->B->C`。
+
+### 缓存层
+
+项目把在线查询和离线构建拆开：
+
+- `offline_build` 从 MySQL 的 `edge` 表读取图数据。
+- 离线阶段计算所有起点到所有终点的最短距离和路径前驱。
+- 结果写入 MySQL，并同步写入 Redis。
+- Redis key 使用版本前缀，例如 `v0:dist:1:2`、`v1:prev:1:2`。
+- `current_version` 记录当前生效版本。
+- 离线构建完成后切换版本，并发布 `cache_update` 消息。
+- 在线服务中的 `CacheUpdateListener` 收到消息后刷新地点映射和 Redis 版本号。
+
+这种方式把复杂的路径计算从在线请求中移除，在线查询主要变成 Redis 读缓存和路径回溯。
+
+### 负载均衡
+
+Nginx 将 80 端口请求转发到三个后端实例：
+
+```text
+127.0.0.1:9090
+127.0.0.1:9091
+127.0.0.1:9092
+```
+
+Nginx upstream 使用轮询策略，并开启到后端的 keepalive 连接复用，减少 TCP 握手成本。
+
+## 压测量化数据
+
+测试对象：`/api/query?start=林1&end=林2`
+
+测试方式：Nginx 80 端口入口，请求转发到 3 个后端实例，后端使用 Redis 缓存命中最短路径结果。
+
+| 场景 | 压测命令 | 并发 | 总请求数 | 后端实例 | Keep-Alive | QPS |
+| --- | --- | ---: | ---: | ---: | --- | ---: |
+| HTTP 长连接 | `ab -n 100000 -c 1000 -k` | 1000 | 100000 | 3 | 是 | 约 22000 req/s |
+
+结论：
+
+- 开启 Keep-Alive 后，客户端到 Nginx 的连接可以复用，减少频繁 TCP 握手和连接释放成本。
+- 在缓存命中的查询场景下，系统瓶颈主要从路径计算转移到网络 I/O、Redis 访问和连接调度。
+- 当前项目在三实例长连接场景下，压测 QPS 约为 2.2w。
+
+可复现的 HTTP 压测命令：
+
+```bash
+ab -n 100000 -c 1000 -k "http://127.0.0.1/api/query?start=林1&end=林2"
+```
+
+自带 TCP 压测工具命令：
+
+```bash
+./build/benchmark 127.0.0.1 9090 100 50 林1 林2
+```
+
+参数含义：
+
+- `100`：并发 TCP 连接数。
+- `50`：每个连接连续发送 50 次查询。
+- 总请求数为 `100 * 50 = 5000`。
 
 ## 项目结构
 
@@ -54,11 +154,12 @@ project/
 - Redis
 - hiredis
 - Nginx
+- Apache Bench，可选，用于 HTTP 压测
 
 CentOS/RHEL 可参考：
 
 ```bash
-sudo yum install -y gcc gcc-c++ cmake make nginx redis hiredis-devel mysql-devel
+sudo yum install -y gcc gcc-c++ cmake make nginx redis hiredis-devel mysql-devel httpd-tools
 ```
 
 如果使用 MariaDB 开发库：
@@ -204,28 +305,6 @@ Redis 中使用双版本机制：
 - 路径缓存使用 `v0:*` 或 `v1:*` 前缀。
 - 离线构建完成后切换版本，并发布 `cache_update` 通知。
 - 运行中的服务收到通知后刷新地点缓存。
-
-## 压测
-
-使用 Apache Bench 测 HTTP 接口：
-
-```bash
-ab -n 100000 -c 1000 -k "http://127.0.0.1/api/query?start=林1&end=林2"
-```
-
-参数含义：
-
-- `-n 100000`：总共发送 100000 个请求。
-- `-c 1000`：同时保持 1000 个并发请求。
-- `-k`：客户端到 Nginx 使用 keep-alive 长连接。
-
-也可以使用项目自带的 TCP 压测工具：
-
-```bash
-./build/benchmark 127.0.0.1 9090 100 50 林1 林2
-```
-
-含义是创建 100 个并发 TCP 连接，每个连接发送 50 次查询。
 
 ## 运行状态观察
 
