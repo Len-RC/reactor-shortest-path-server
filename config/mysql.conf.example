@@ -1,0 +1,6 @@
+# Copy this file to config/mysql.conf and adjust the values for your server.
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASS=root
+MYSQL_DB=reactor_db

@@ -14,6 +14,9 @@ build/
 logs/
 *.log
 
+# 本地配置
+config/mysql.conf
+
 # 临时文件
 *.tmp
 *.bak

@@ -46,13 +46,24 @@ else()
 endif()
 
 # ===== server =====
-add_executable(server src/server.cpp)
+add_executable(server
+  src/server.cpp
+  src/cache/CacheUpdateListener.cpp
+  src/cache/RedisPool.cpp
+  src/db/ConnectionPool.cpp
+  src/net/Acceptor.cpp
+  src/net/ConnectionHandler.cpp
+  src/net/EventLoop.cpp
+  src/net/Handler.cpp
+  src/net/ReactorPool.cpp
+  src/thread/ThreadPool.cpp
+)
 if(MYSQL_CONFIG)
   target_compile_options(server PRIVATE ${MYSQL_CFLAGS_LIST})
   target_link_libraries(server PRIVATE ${MYSQL_LDFLAGS_LIST} Threads::Threads ${HIREDIS_LIBRARIES})
-  target_include_directories(server PRIVATE ${HIREDIS_INCLUDE_DIRS})
+  target_include_directories(server PRIVATE src ${HIREDIS_INCLUDE_DIRS})
 else()
-  target_include_directories(server PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS} ${HIREDIS_INCLUDE_DIRS})
+  target_include_directories(server PRIVATE src ${MYSQLCLIENT_INCLUDE_DIRS} ${HIREDIS_INCLUDE_DIRS})
   target_link_libraries(server PRIVATE ${MYSQLCLIENT_LIBRARIES} Threads::Threads ${HIREDIS_LIBRARIES})
 endif()
 
@@ -71,4 +82,3 @@ else()
   target_include_directories(offline_build PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS} ${HIREDIS_INCLUDE_DIRS})
   target_link_libraries(offline_build PRIVATE ${MYSQLCLIENT_LIBRARIES} Threads::Threads ${HIREDIS_LIBRARIES})
 endif()
-
