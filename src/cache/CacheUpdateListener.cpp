@@ -17,7 +17,7 @@ void CacheUpdateListener::start(int port) {
         return;
     }
 
-    std::cout << "启动缓存更新监听器（端口 " << port << "）...\n";
+    std::cout << "启动缓存更新监听器（端口是： " << port << "）...\n";
 
     listener_thread_ = std::thread([this]() {
         redisReply* reply = (redisReply*)redisCommand(sub_ctx_, "SUBSCRIBE cache_update");
